@@ -115,10 +115,17 @@ class CompressedTokenizer:
         pos_mask = arr >= 0
         out = arr.copy()
         valid_ids = arr[pos_mask]
+        # Critical bounds check to prevent IndexError if input contains token IDs >= vocab_size
+        valid_ids = np.clip(valid_ids, 0, len(self.lookup_table) - 1)
         out[pos_mask] = self.lookup_table[valid_ids]
         return out   
     
     def __call__(self, input_ids):
+        # Input validation for consistency with other methods
+        if input_ids is None:
+            raise ValueError("input_ids cannot be None")
+        if not isinstance(input_ids, (list, np.ndarray, torch.Tensor)):
+            raise ValueError("input_ids must be array-like (list, numpy array, or torch tensor)")
         return self._compress(input_ids)
             
 class ShortConv(nn.Module):
@@ -378,8 +385,9 @@ class Engram(nn.Module):
         
         try:
             hash_input_ids = torch.from_numpy(self.hash_mapping.hash(input_ids)[self.layer_id])
-            # Ensure device placement consistency
-            hash_input_ids = hash_input_ids.to(hidden_states.device)
+            # Ensure device placement consistency - only transfer if needed
+            if hash_input_ids.device != hidden_states.device:
+                hash_input_ids = hash_input_ids.to(hidden_states.device)
             
             embeddings = self.multi_head_embedding(hash_input_ids).flatten(start_dim=-2)
             gates = []
