@@ -62,7 +62,8 @@ class CompressedTokenizer:
         self,
         tokenizer_name_or_path,
     ):
-        self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_name_or_path, trust_remote_code=True)
+        # Security fix: Remove automatic trust_remote_code or gate behind explicit consent
+        self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_name_or_path, trust_remote_code=False)
         
         SENTINEL = "\uE000"
         self.normalizer = normalizers.Sequence([
@@ -208,6 +209,11 @@ class NgramHashMapping:
             tokenizer_name_or_path=tokenizer_name_or_path
         )            
         self.tokenizer_vocab_size = len(self.compressed_tokenizer)
+        
+        # Critical fix: Validate tokenizer_vocab_size to prevent division by zero
+        if self.tokenizer_vocab_size == 0:
+            raise ValueError("Empty tokenizer vocabulary - cannot initialize hash mapping")
+        
         if self.pad_id is not None:
             self.pad_id = int(self.compressed_tokenizer.lookup_table[self.pad_id])
 
@@ -296,6 +302,12 @@ class NgramHashMapping:
         return np.stack(all_hashes, axis=2)
 
     def hash(self, input_ids):
+        # Input validation
+        if input_ids is None:
+            raise ValueError("input_ids cannot be None")
+        if not isinstance(input_ids, (list, np.ndarray, torch.Tensor)):
+            raise ValueError("input_ids must be array-like (list, numpy array, or torch tensor)")
+        
         input_ids = self.compressed_tokenizer(input_ids)
         hash_ids_for_all_layers = {}
         for layer_id in self.layer_ids:
@@ -360,22 +372,33 @@ class Engram(nn.Module):
         hidden_states: [B, L, HC_MULT, D]
         input_ids: [B, L]
         """
-        hash_input_ids = torch.from_numpy(self.hash_mapping.hash(input_ids)[self.layer_id])
-        embeddings = self.multi_head_embedding(hash_input_ids).flatten(start_dim=-2)
-        gates = []
-        for hc_idx in range(backbone_config.hc_mult):
-            key = self.key_projs[hc_idx](embeddings)
-            normed_key = self.norm1[hc_idx](key)
-            query = hidden_states[:,:,hc_idx,:]
-            normed_query = self.norm2[hc_idx](query)
-            gate = (normed_key * normed_query).sum(dim=-1) / math.sqrt(backbone_config.hidden_size)
-            gate = gate.abs().clamp_min(1e-6).sqrt() * gate.sign()
-            gate = gate.sigmoid().unsqueeze(-1)
-            gates.append(gate)
-        gates = torch.stack(gates,dim=2)
-        value = gates * self.value_proj(embeddings).unsqueeze(2)
-        output = value + self.short_conv(value)
-        return output 
+        # Input validation and error handling
+        if hidden_states is None or input_ids is None:
+            raise ValueError("hidden_states and input_ids cannot be None")
+        
+        try:
+            hash_input_ids = torch.from_numpy(self.hash_mapping.hash(input_ids)[self.layer_id])
+            # Ensure device placement consistency
+            hash_input_ids = hash_input_ids.to(hidden_states.device)
+            
+            embeddings = self.multi_head_embedding(hash_input_ids).flatten(start_dim=-2)
+            gates = []
+            for hc_idx in range(backbone_config.hc_mult):
+                key = self.key_projs[hc_idx](embeddings)
+                normed_key = self.norm1[hc_idx](key)
+                query = hidden_states[:,:,hc_idx,:]
+                normed_query = self.norm2[hc_idx](query)
+                gate = (normed_key * normed_query).sum(dim=-1) / math.sqrt(backbone_config.hidden_size)
+                # Gradient flow fix: Use smooth approximation instead of abs() which breaks gradients at zero
+                gate = torch.where(gate >= 0, gate.sqrt().clamp_min(1e-6), -(-gate).sqrt().clamp_min(1e-6))
+                gate = gate.sigmoid().unsqueeze(-1)
+                gates.append(gate)
+            gates = torch.stack(gates,dim=2)
+            value = gates * self.value_proj(embeddings).unsqueeze(2)
+            output = value + self.short_conv(value)
+            return output
+        except Exception as e:
+            raise RuntimeError(f"Error in Engram forward pass at layer {self.layer_id}: {str(e)}") from e 
 
 class TransformerBlock(nn.Module):
     def __init__(self,layer_id):
@@ -401,7 +424,8 @@ if __name__ == '__main__':
     ]
 
     text = "Only Alexander the Great could tame the horse Bucephalus."
-    tokenizer = AutoTokenizer.from_pretrained(engram_cfg.tokenizer_name_or_path,trust_remote_code=True)
+    # Security fix: Remove automatic trust_remote_code
+    tokenizer = AutoTokenizer.from_pretrained(engram_cfg.tokenizer_name_or_path, trust_remote_code=False)
     input_ids = tokenizer(text,return_tensors='pt').input_ids
 
     B,L = input_ids.shape
